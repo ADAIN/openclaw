@@ -1,5 +1,8 @@
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { createEditTool, createReadTool, createWriteTool } from "@mariozechner/pi-coding-agent";
+import ignore from "ignore";
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { AnyAgentTool } from "./pi-tools.types.js";
 import { detectMime } from "../media/mime.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
@@ -261,11 +264,127 @@ function wrapSandboxPathGuard(tool: AnyAgentTool, root: string): AnyAgentTool {
         (args && typeof args === "object" ? (args as Record<string, unknown>) : undefined);
       const filePath = record?.path;
       if (typeof filePath === "string" && filePath.trim()) {
-        await assertSandboxPath({ filePath, cwd: root, root });
+        const { resolved } = await assertSandboxPath({ filePath, cwd: root, root });
+        await checkIgnorePolicy(resolved, root);
       }
       return tool.execute(toolCallId, normalized ?? args, signal, onUpdate);
     },
   };
+}
+
+// Checks for .ignore files in all parent directories up to root.
+// Collects rules from all .ignore files and checks if the target path is ignored.
+// Emulates hierarchical behavior where rules are accumulated.
+async function checkIgnorePolicy(absoluteFilePath: string, root: string): Promise<void> {
+  const rootResolved = path.resolve(root);
+  // Calculate relative path from root to the target file
+  const relativeToRoot = path.relative(rootResolved, absoluteFilePath);
+
+  if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot)) {
+    // Should have been caught by assertSandboxPath, but just in case
+    return;
+  }
+
+  const ig = ignore();
+
+  // Traverse from root down to the file's directory
+  // For each directory, look for .ignore and add its rules
+  // The trick is to scope the rules to that directory.
+  // ignore() matches against the path string provided to ignores().
+  // If we add rules like "foo.txt" from "sub/.ignore", and we test "sub/foo.txt",
+  // we need the rule to be effectively "sub/foo.txt".
+  // However, `ignore` library supports relative paths if we treat the whole thing as one repo.
+  // But standard .gitignore behavior implies rules in subdirs are relative to that subdir.
+  // The 'ignore' package documentation says:
+  // "There is no current plan to support multiple .gitignore files in nested directories."
+  // So we have to simulate it manually or simplistically.
+
+  // STRATEGY:
+  // We collect all .ignore files from root to target dir.
+  // For each .ignore file found at `dir`, we read its rules.
+  // We transform each rule: if rule is `pattern`, we prefix it with `path.relative(root, dir)`.
+  // e.g. root/.ignore: "*.log" -> "*.log"
+  //      root/sub/.ignore: "*.secret" -> "sub/*.secret"
+  //      root/sub/.ignore: "!foo.secret" -> "!sub/foo.secret"
+  // This allows us to feed a single global path (relative to root) to `ig.ignores()`.
+
+  const targetDir = path.dirname(absoluteFilePath);
+  let currentDir = rootResolved;
+
+  // We need to walk step by step from root to targetDir
+  // Construct path segments
+  const segments = relativeToRoot.split(path.sep);
+  // The file itself is the last segment, we want to check directories up to its parent
+  // actually, we should check .ignore in the file's directory too (if it exists)
+  // But `relativeToRoot` includes the filename. `path.dirname` handles it.
+
+  // List of directories to check: root, root/sub1, root/sub1/sub2, ...
+  const dirsToCheck: string[] = [rootResolved];
+  let accumPath = rootResolved;
+
+  // Remove filename from segments to get directories
+  const dirSegments = segments.slice(0, -1);
+
+  for (const segment of dirSegments) {
+    accumPath = path.join(accumPath, segment);
+    dirsToCheck.push(accumPath);
+  }
+
+  for (const dir of dirsToCheck) {
+    const ignorePath = path.join(dir, ".ignore");
+    try {
+      const content = await fs.readFile(ignorePath, "utf8");
+
+      // Calculate prefix for this directory relative to root
+      // e.g. "" for root, "sub/" for sub
+      let prefix = path.relative(rootResolved, dir);
+      if (prefix && !prefix.endsWith("/")) {
+        prefix += "/";
+      }
+      if (prefix === "") prefix = ""; // Ensure empty string for root
+
+      const rules = content.split(/\r?\n/);
+      const scopedRules: string[] = [];
+
+      for (let rule of rules) {
+        rule = rule.trim();
+        if (!rule || rule.startsWith("#")) continue;
+
+        // Handle negation
+        const isNegative = rule.startsWith("!");
+        if (isNegative) {
+          rule = rule.slice(1);
+        }
+
+        // Handle root-anchored rules in gitignore (starting with /)
+        // In a subdir .gitignore, /foo means subdir/foo.
+        if (rule.startsWith("/")) {
+          rule = rule.slice(1);
+        }
+
+        // Combine prefix and rule
+        let scopedRule = prefix + rule;
+
+        if (isNegative) {
+          scopedRule = "!" + scopedRule;
+        }
+
+        scopedRules.push(scopedRule);
+      }
+
+      ig.add(scopedRules);
+    } catch (err: any) {
+      if (err.code !== "ENOENT") {
+        // Log error but allow access? Or strict deny?
+        // Let's allow access if we can't read .ignore (e.g. permission error might be weird)
+        // but safest is to ignore the error (treat as no .ignore)
+      }
+    }
+  }
+
+  if (ig.ignores(relativeToRoot)) {
+    throw new Error(`Access denied: Path ${relativeToRoot} is ignored by .ignore policy.`);
+  }
 }
 
 export function createSandboxedReadTool(root: string) {
