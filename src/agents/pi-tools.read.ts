@@ -276,72 +276,58 @@ function wrapSandboxPathGuard(tool: AnyAgentTool, root: string): AnyAgentTool {
 // Collects rules from all .ignore files and checks if the target path is ignored.
 // Emulates hierarchical behavior where rules are accumulated.
 async function checkIgnorePolicy(absoluteFilePath: string, root: string): Promise<void> {
-  const rootResolved = path.resolve(root);
-  // Calculate relative path from root to the target file
-  const relativeToRoot = path.relative(rootResolved, absoluteFilePath);
+  const fileDir = path.dirname(absoluteFilePath);
 
-  if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot)) {
-    // Should have been caught by assertSandboxPath, but just in case
-    return;
+  // Find search start directory (anchor)
+  // Optimization: If file is inside workspace root, start from root.
+  // If outside, start from system root.
+  const rootResolved = path.resolve(root);
+  const relToWorkspace = path.relative(rootResolved, absoluteFilePath);
+  const isInsideWorkspace = !relToWorkspace.startsWith("..") && !path.isAbsolute(relToWorkspace);
+
+  // Anchor directory: where we start considering paths "relative to" for the ignore instance.
+  // All rules will be rewritten to be relative to this anchor.
+  const anchorDir = isInsideWorkspace ? rootResolved : path.parse(absoluteFilePath).root;
+
+  const dirsToCheck: string[] = [];
+  let current = fileDir;
+
+  // Traverse up to anchorDir
+  while (true) {
+    dirsToCheck.push(current);
+    if (current === anchorDir || current === path.dirname(current)) {
+      break;
+    }
+    // Safety check to prevent infinite loop if anchorDir is somehow unreachable (e.g. cross-drive)
+    const parent = path.dirname(current);
+    if (parent === current) break; // Reached system root
+    current = parent;
+
+    // Stop if we went past anchorDir (should be caught by equality check above, but for safety)
+    if (isInsideWorkspace && current.length < anchorDir.length) break;
   }
+
+  // Process from top (anchor) down to fileDir
+  dirsToCheck.reverse();
 
   const ig = ignore();
-
-  // Traverse from root down to the file's directory
-  // For each directory, look for .ignore and add its rules
-  // The trick is to scope the rules to that directory.
-  // ignore() matches against the path string provided to ignores().
-  // If we add rules like "foo.txt" from "sub/.ignore", and we test "sub/foo.txt",
-  // we need the rule to be effectively "sub/foo.txt".
-  // However, `ignore` library supports relative paths if we treat the whole thing as one repo.
-  // But standard .gitignore behavior implies rules in subdirs are relative to that subdir.
-  // The 'ignore' package documentation says:
-  // "There is no current plan to support multiple .gitignore files in nested directories."
-  // So we have to simulate it manually or simplistically.
-
-  // STRATEGY:
-  // We collect all .ignore files from root to target dir.
-  // For each .ignore file found at `dir`, we read its rules.
-  // We transform each rule: if rule is `pattern`, we prefix it with `path.relative(root, dir)`.
-  // e.g. root/.ignore: "*.log" -> "*.log"
-  //      root/sub/.ignore: "*.secret" -> "sub/*.secret"
-  //      root/sub/.ignore: "!foo.secret" -> "!sub/foo.secret"
-  // This allows us to feed a single global path (relative to root) to `ig.ignores()`.
-
-  const targetDir = path.dirname(absoluteFilePath);
-  let currentDir = rootResolved;
-
-  // We need to walk step by step from root to targetDir
-  // Construct path segments
-  const segments = relativeToRoot.split(path.sep);
-  // The file itself is the last segment, we want to check directories up to its parent
-  // actually, we should check .ignore in the file's directory too (if it exists)
-  // But `relativeToRoot` includes the filename. `path.dirname` handles it.
-
-  // List of directories to check: root, root/sub1, root/sub1/sub2, ...
-  const dirsToCheck: string[] = [rootResolved];
-  let accumPath = rootResolved;
-
-  // Remove filename from segments to get directories
-  const dirSegments = segments.slice(0, -1);
-
-  for (const segment of dirSegments) {
-    accumPath = path.join(accumPath, segment);
-    dirsToCheck.push(accumPath);
-  }
 
   for (const dir of dirsToCheck) {
     const ignorePath = path.join(dir, ".ignore");
     try {
       const content = await fs.readFile(ignorePath, "utf8");
 
-      // Calculate prefix for this directory relative to root
-      // e.g. "" for root, "sub/" for sub
-      let prefix = path.relative(rootResolved, dir);
-      if (prefix && !prefix.endsWith("/")) {
-        prefix += "/";
+      // Calculate prefix for this directory relative to anchor
+      let prefix = path.relative(anchorDir, dir);
+      if (prefix && !prefix.endsWith(path.sep)) {
+        prefix += path.sep;
       }
-      if (prefix === "") prefix = ""; // Ensure empty string for root
+      // On Windows/generic, relative might return "" for same dir.
+      // Ensure we treat it correctly.
+      if (dir === anchorDir) prefix = "";
+
+      // Normalize path separators to forward slashes for 'ignore' package
+      prefix = prefix.split(path.sep).join("/");
 
       const rules = content.split(/\r?\n/);
       const scopedRules: string[] = [];
@@ -375,15 +361,17 @@ async function checkIgnorePolicy(absoluteFilePath: string, root: string): Promis
       ig.add(scopedRules);
     } catch (err: any) {
       if (err.code !== "ENOENT") {
-        // Log error but allow access? Or strict deny?
-        // Let's allow access if we can't read .ignore (e.g. permission error might be weird)
-        // but safest is to ignore the error (treat as no .ignore)
+        // Ignore read errors (permission etc), treat as no .ignore
       }
     }
   }
 
-  if (ig.ignores(relativeToRoot)) {
-    throw new Error(`Access denied: Path ${relativeToRoot} is ignored by .ignore policy.`);
+  // Check the file path relative to anchor
+  let checkPath = path.relative(anchorDir, absoluteFilePath);
+  checkPath = checkPath.split(path.sep).join("/");
+
+  if (ig.ignores(checkPath)) {
+    throw new Error(`Access denied: Path ${absoluteFilePath} is ignored by .ignore policy.`);
   }
 }
 
@@ -402,7 +390,7 @@ export function createSandboxedEditTool(root: string) {
   return wrapSandboxPathGuard(wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.edit), root);
 }
 
-export function createOpenClawReadTool(base: AnyAgentTool): AnyAgentTool {
+export function createOpenClawReadTool(base: AnyAgentTool, root?: string): AnyAgentTool {
   const patched = patchToolSchemaForClaudeCompatibility(base);
   return {
     ...patched,
@@ -412,6 +400,20 @@ export function createOpenClawReadTool(base: AnyAgentTool): AnyAgentTool {
         normalized ??
         (params && typeof params === "object" ? (params as Record<string, unknown>) : undefined);
       assertRequiredParams(record, CLAUDE_PARAM_GROUPS.read, base.name);
+
+      // Check .ignore policy if root is provided
+      if (root) {
+        const filePath = typeof record?.path === "string" ? String(record.path) : undefined;
+        if (filePath && filePath.trim()) {
+          // We don't enforce assertSandboxPath here for non-sandboxed tools,
+          // but we DO want to check .ignore if possible.
+          // However, resolveSandboxPath logic is useful to get absolute path.
+          // If we don't have assertSandboxPath strictness, we can just resolve manually.
+          const resolved = path.resolve(root, filePath);
+          await checkIgnorePolicy(resolved, root);
+        }
+      }
+
       const result = await base.execute(toolCallId, normalized ?? params, signal);
       const filePath = typeof record?.path === "string" ? String(record.path) : "<unknown>";
       const normalizedResult = await normalizeReadImageResult(result, filePath);
