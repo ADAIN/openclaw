@@ -8,6 +8,11 @@ import { detectMime } from "../media/mime.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 import { sanitizeToolResultImages } from "./tool-images.js";
 
+// Cache for Ignore instances per directory-anchor pair to avoid re-reading .ignore files repeatedly.
+// Key: `${anchorDir}\0${directoryPath}`
+// Value: Ignore instance containing aggregated rules for that directory context.
+const ignoreCache = new Map<string, ReturnType<typeof ignore>>();
+
 // NOTE(steipete): Upstream read now does file-magic MIME detection; we keep the wrapper
 // to normalize payloads and sanitize oversized images before they hit providers.
 type ToolContentBlock = AgentToolResult<unknown>["content"][number];
@@ -289,81 +294,95 @@ async function checkIgnorePolicy(absoluteFilePath: string, root: string): Promis
   // All rules will be rewritten to be relative to this anchor.
   const anchorDir = isInsideWorkspace ? rootResolved : path.parse(absoluteFilePath).root;
 
-  const dirsToCheck: string[] = [];
-  let current = fileDir;
+  const cacheKey = `${anchorDir}\0${fileDir}`;
+  let ig = ignoreCache.get(cacheKey);
 
-  // Traverse up to anchorDir
-  while (true) {
-    dirsToCheck.push(current);
-    if (current === anchorDir || current === path.dirname(current)) {
-      break;
-    }
-    // Safety check to prevent infinite loop if anchorDir is somehow unreachable (e.g. cross-drive)
-    const parent = path.dirname(current);
-    if (parent === current) break; // Reached system root
-    current = parent;
+  if (!ig) {
+    const dirsToCheck: string[] = [];
+    let current = fileDir;
 
-    // Stop if we went past anchorDir (should be caught by equality check above, but for safety)
-    if (isInsideWorkspace && current.length < anchorDir.length) break;
-  }
-
-  // Process from top (anchor) down to fileDir
-  dirsToCheck.reverse();
-
-  const ig = ignore();
-
-  for (const dir of dirsToCheck) {
-    const ignorePath = path.join(dir, ".ignore");
-    try {
-      const content = await fs.readFile(ignorePath, "utf8");
-
-      // Calculate prefix for this directory relative to anchor
-      let prefix = path.relative(anchorDir, dir);
-      if (prefix && !prefix.endsWith(path.sep)) {
-        prefix += path.sep;
+    // Traverse up to anchorDir
+    while (true) {
+      dirsToCheck.push(current);
+      if (current === anchorDir || current === path.dirname(current)) {
+        break;
       }
-      // On Windows/generic, relative might return "" for same dir.
-      // Ensure we treat it correctly.
-      if (dir === anchorDir) prefix = "";
-
-      // Normalize path separators to forward slashes for 'ignore' package
-      prefix = prefix.split(path.sep).join("/");
-
-      const rules = content.split(/\r?\n/);
-      const scopedRules: string[] = [];
-
-      for (let rule of rules) {
-        rule = rule.trim();
-        if (!rule || rule.startsWith("#")) continue;
-
-        // Handle negation
-        const isNegative = rule.startsWith("!");
-        if (isNegative) {
-          rule = rule.slice(1);
-        }
-
-        // Handle root-anchored rules in gitignore (starting with /)
-        // In a subdir .gitignore, /foo means subdir/foo.
-        if (rule.startsWith("/")) {
-          rule = rule.slice(1);
-        }
-
-        // Combine prefix and rule
-        let scopedRule = prefix + rule;
-
-        if (isNegative) {
-          scopedRule = "!" + scopedRule;
-        }
-
-        scopedRules.push(scopedRule);
+      // Safety check to prevent infinite loop if anchorDir is somehow unreachable (e.g. cross-drive)
+      const parent = path.dirname(current);
+      if (parent === current) {
+        break; // Reached system root
       }
+      current = parent;
 
-      ig.add(scopedRules);
-    } catch (err: any) {
-      if (err.code !== "ENOENT") {
-        // Ignore read errors (permission etc), treat as no .ignore
+      // Stop if we went past anchorDir (should be caught by equality check above, but for safety)
+      if (isInsideWorkspace && current.length < anchorDir.length) {
+        break;
       }
     }
+
+    // Process from top (anchor) down to fileDir
+    dirsToCheck.reverse();
+
+    ig = ignore();
+
+    for (const dir of dirsToCheck) {
+      const ignorePath = path.join(dir, ".ignore");
+      try {
+        const content = await fs.readFile(ignorePath, "utf8");
+
+        // Calculate prefix for this directory relative to anchor
+        let prefix = path.relative(anchorDir, dir);
+        if (prefix && !prefix.endsWith(path.sep)) {
+          prefix += path.sep;
+        }
+        // On Windows/generic, relative might return "" for same dir.
+        // Ensure we treat it correctly.
+        if (dir === anchorDir) {
+          prefix = "";
+        }
+
+        // Normalize path separators to forward slashes for 'ignore' package
+        prefix = prefix.split(path.sep).join("/");
+
+        const rules = content.split(/\r?\n/);
+        const scopedRules: string[] = [];
+
+        for (let rule of rules) {
+          rule = rule.trim();
+          if (!rule || rule.startsWith("#")) {
+            continue;
+          }
+
+          // Handle negation
+          const isNegative = rule.startsWith("!");
+          if (isNegative) {
+            rule = rule.slice(1);
+          }
+
+          // Handle root-anchored rules in gitignore (starting with /)
+          // In a subdir .gitignore, /foo means subdir/foo.
+          if (rule.startsWith("/")) {
+            rule = rule.slice(1);
+          }
+
+          // Combine prefix and rule
+          let scopedRule = prefix + rule;
+
+          if (isNegative) {
+            scopedRule = "!" + scopedRule;
+          }
+
+          scopedRules.push(scopedRule);
+        }
+
+        ig.add(scopedRules);
+      } catch (err: unknown) {
+        if ((err as { code?: string }).code !== "ENOENT") {
+          // Ignore read errors (permission etc), treat as no .ignore
+        }
+      }
+    }
+    ignoreCache.set(cacheKey, ig);
   }
 
   // Check the file path relative to anchor
